@@ -1,1198 +1,1096 @@
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// CrazyDemon
-// Отсылка данных с датчиков по MQTT на домашний HomeAssistant и по TCP на сайт narodmon.ru
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//Скетч для передачи показаний с беспроводных датчиков Oregon Scientific на сервис “Народный Мониторинга” (narodmon.ru)
-//с помощью Arduino-совместимых плат на основе ESP8266 (Wemos D1, NodeMCU).
-// https://github.com/invandy - библиотека и исходник скетча
-//
-//Для подключения необходимы:
-//- Сам датчик Oregon Scientific THN132N, THGN132N, THGN123 и т.п.,
-//- Плата микроконтроллера на основе ESP8266 (Wemos D1 или NodeMCU),
-//- Приёмник OOK 433Мгц (Питание 3В, подключается к D7 платы микроконтроллера),
-//- WiFi подключение к Интернет
-//- Arduino IDE с установленной поддержкой ESP8266-совместимых устройств и библиотекой Oregon_NR
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/*  CrazyDemon Weather
+    JSON + narodmon.ru + Oregon Scientific + BMP180
+    --------------------------------------------------------------------
+    Production sketch for ESP8266 (Wemos D1, NodeMCU) with:
+      - Oregon Scientific THGN132N / THN132N wireless sensors
+      - BMP180 (temperature, pressure, altitude)
+      - 433 MHz OOK receiver on D7 (GPIO13)
+      - WiFi (ESP8266) + HTTP server
+      - JSON export for narodmon.ru and local /json
+      - Web UI (material-like, dark/light themes)
+      - NTP time sync + timezone stored in EEPROM
+      - Runtime logging with ring buffer, web log and Serial
+
+    Скетч для:
+      - приёма данных с беспроводных датчиков Oregon Scientific,
+      - вывода информации на встроенную веб‑страницу,
+      - отправки показаний на сервис narodmon.ru (HTTP JSON),
+      - логирования работы устройства с отметкой времени.
+
+    Исходная библиотека Oregon_NR и оригинальный скетч:
+    https://github.com/invandy
+
+    Hardware:
+      - ESP8266 (Wemos D1 / NodeMCU)
+      - OOK 433 MHz receiver (3V, data → D7 / GPIO13)
+      - BMP180 (I2C)
+*/
 
 #include "Oregon_NR.h"
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
-#include <PubSubClient.h>
+#include <Wire.h>
 #include <Adafruit_BMP085.h>
+#include <EEPROM.h>
+#include <time.h>
+
 Adafruit_BMP085 bmp;
 
-ESP8266WebServer server(80); // включение сервера на порту:80
+// HTTP server on port 80
+// Веб‑сервер на порту 80
+ESP8266WebServer server(80);
 
-#define TEST_MODE        0   //Режим отладки (данные на narodmon.ru не отсылаются, изменить на 1 для отсылки)
+#define TESTMODE 0  // 0 = normal (send to narodmon), 1 = test mode (no send)
+// 0 = рабочий режим (отправка на narodmon), 1 = тест (без отправки)
 
-//Кол-во датчиков различных типов используемых в системе. 
-//Для экономии памяти можно обнулить неиспользуемые типы датчиков
-#define NOF_132     2     //THGN132
-#define NOF_500     0     //THGN500
-#define NOF_968     0     //BTHR968
-#define NOF_129     0     //BTHGN129
-#define NOF_318     0     //RTGN318
-#define NOF_800     0     //THGR810
-#define NOF_THP     0     //THP
+// Number of supported Oregon THGN132/THN132 channels (1..3)
+// Количество поддерживаемых каналов THGN132/THN132 (1..3)
+#define NOF_132 3
 
-#define SEND_INTERVAL 300000            //Интервал отсылки данных на сервер, мс
-//#define SEND_INTERVAL 10000            //Интервал отсылки данных на сервер, мс
-#define CONNECT_TIMEOUT 10000           //Время ожидания  соединения, мс
-#define DISCONNECT_TIMEOUT 10000        //Время ожидания отсоединения, мс
+// Send interval to narodmon (ms)
+// Интервал отправки данных на narodmon (мс)
+#define SENDINTERVAL 300000UL    // 5 minutes / 5 минут
+#define CONNECTTIMEOUT 10000     // WiFi connect timeout (ms) / тайм‑аут подключения к WiFi (мс)
+#define DISCONNECTTIMEOUT 10000  // HTTP timeout (ms) / тайм‑аут HTTP‑соединения (мс)
 
-#define mac       "CrazyDemon463E52"  //МАС-адрес на narodmon.ru
-#define ssid      "wifi"                //Параметры входа в WiFi, земенить на свои
-#define password  "1234567890"
+// Device MAC (narodmon ID)
+// MAC‑адрес устройства на narodmon.ru (используется как ID), можно комбинировать с именем для удобства
+#define mac "DeviceName001122334455"
 
-// MQTT config
-#define AIO_SERVER      "192.168.1.3"
-#define AIO_SERVERPORT  1883                   // def. 1883, use 8883 for SSL
-#define AIO_USERNAME    "meteo"
-#define AIO_KEY         "kjdsf894jkr3"
-#define AIO_TOPIC       "1234567890"
+// WiFi credentials / Параметры WiFi - обязательно сменить на свои
+#define ssid "wifi"
+#define password "12345678"
 
-// MQTT
-/*
-void callback(const MQTT::Publish& pub) {
-  // handle message arrived
+// Status LEDs (GPIO numbers; 255 = not used)
+// Светодиоды статуса (GPIO; 255 = не используется)
+#define BLUE_LED 2    // WiFi activity / активность WiFi
+#define GREEN_LED 14  // send OK to narodmon / успешная отправка на narodmon
+#define RED_LED 255   // send FAIL to narodmon / ошибка отправки
+
+// Logging configuration
+// Дефолтные Настройки логирования. После можно изменить в настройках на вебстранице
+#define DEBUG_LEVEL_DEFAULT 1  // default debug level (0..3) / уровень по умолчанию (0..3)
+#define FORCE_SERIAL_DEBUG 0   // 1 = always log to Serial, ignore UI / 1 = всегда логировать в Serial
+
+// HTTP Basic Auth for /config and /log
+// Авторизация на страницах /config и /log (замените на свои)
+#define CONFIG_USER "admin"
+#define CONFIG_PASS "admin123"
+
+// EEPROM layout for persistent config
+// Layout EEPROM для сохранения настроек
+#define EEPROM_SIZE 64
+#define EEPROM_MAGIC 0x42
+#define EEPROM_VERSION 3  // версия структуры LogConfig
+
+// Persistent configuration structure stored in EEPROM
+// Структура конфигурации, хранимая в EEPROM
+struct LogConfig {
+  uint8_t magic;           // magic marker / сигнатура
+  uint8_t version;         // struct version / версия структуры
+  uint8_t debugLevel;      // 0..3 debug level / уровень логирования
+  uint8_t logToSerial;     // 0 = web log, 1 = Serial / выбор вывода
+  int8_t tzOffsetHours;    // timezone offset in hours (−12..+14) / часовой пояс
+  uint8_t refreshMainSec;  // auto refresh main page (seconds) / автообновление главной страницы
+  uint8_t refreshLogSec;   // auto refresh log page (seconds) / автообновление страницы логов
+};
+
+// Exponential smoothing for sensor values (affects only values, not reception quality)
+// Параметры сглаживания (влияют только на плавность показаний, не на приём)
+const float SMOOTH_ALPHA = 0.3f;  // 30% new, 70% old / 30% новое, 70% предыдущее значение
+
+// NTP server / NTP сервер
+const char *ntpServer = "pool.ntp.org";
+
+// narodmon send interval
+// Интервал отправки данных на narodmon
+const unsigned long postingInterval = SENDINTERVAL;
+unsigned long lastConnectionTime = 0;
+
+// Oregon receiver on D7 (GPIO13), LED on BLUE_LED
+// Приёмник 433 МГц на D7 (GPIO13), светодиод BLUE_LED
+Oregon_NR oregon(13, 13, BLUE_LED, true);
+
+// THGN132/THN132 sensor state
+// Структура для хранения данных по каналам THGN132/THN132
+struct BTHGNsensor {
+  bool isreceived = false;     // at least one valid packet seen / был ли хоть один валидный пакет
+  byte numberofreceiving = 0;  // number of received frames (for averaging) / число принятых кадров
+  unsigned long rcvtime = 0;   // millis() of last receive / время последнего приёма
+  byte chnl = 0;               // sensor channel (1..3) / канал датчика (1..3)
+  word type = 0;               // sensor type / тип датчика
+  float temperature = 0;       // temperature (°C) / температура (°C)
+  float humidity = 0;          // humidity (%) / влажность (%)
+  bool battery = true;         // battery ok flag / состояние батареи
+};
+
+BTHGNsensor tsensor[NOF_132];
+
+// TCP client for narodmon HTTP
+// Клиент TCP для отправки данных на narodmon
+WiFiClient narodClient;
+
+// Runtime logging settings (can be changed via /config)
+// Настройки логирования (меняются через /config)
+uint8_t debugLevel = DEBUG_LEVEL_DEFAULT;  // current debug level / текущий уровень логирования
+bool logToSerial = true;                   // true = Serial, false = web log / куда писать лог
+int8_t tzOffsetHours = 9;                  // default timezone GMT+9 / часовой пояс по умолчанию
+uint8_t refreshMainSec = 30;               // main page auto refresh / автообновление главной страницы
+uint8_t refreshLogSec = 5;                 // log page auto refresh / автообновление страницы логов
+
+// -------- Ring buffer for logs / Кольцевой буфер логов --------
+const size_t LOG_BUFFER_MAX = 4000;
+char logBuf[LOG_BUFFER_MAX];
+size_t logHead = 0;
+bool logWrapped = false;
+
+// Append message to ring buffer (web log)
+// Добавить строку в кольцевой буфер (для веб‑лога)
+void logToRingBuffer(const String &msg) {
+  for (size_t i = 0; i < msg.length(); i++) {
+    logBuf[logHead] = msg[i];
+    logHead = (logHead + 1) % LOG_BUFFER_MAX;
+    if (logHead == 0) logWrapped = true;
+  }
+  logBuf[logHead] = '\n';
+  logHead = (logHead + 1) % LOG_BUFFER_MAX;
+  if (logHead == 0) logWrapped = true;
 }
-*/
 
-WiFiClient wclient;
-PubSubClient client(wclient, AIO_SERVER);
+// Dump ring buffer as String
+// Получить весь лог из кольцевого буфера
+String getLogBufferString() {
+  String out;
+  if (!logWrapped) {
+    for (size_t i = 0; i < logHead; i++) out += logBuf[i];
+  } else {
+    size_t i = logHead;
+    do {
+      out += logBuf[i];
+      i = (i + 1) % LOG_BUFFER_MAX;
+    } while (i != logHead);
+  }
+  return out;
+}
 
-#define BLUE_LED 2      //Индикация подключения к WiFi
-#define GREEN_LED 14    //Индикатор успешной доставки пакета а народмон
-#define RED_LED 255     //Индикатор ошибки доставки пакета на народмон
+// Convert RSSI (dBm) to 0..100%
+// Перевод RSSI (dBm) в проценты 0..100
+int wifiRssiToPercent(int rssi) {
+  if (rssi <= -90) return 0;
+  if (rssi >= -30) return 100;
+  return (rssi + 90) * 100 / 60;
+}
 
-//Параметоы соединения с narodmon:
-char nardomon_server[] = "narodmon.ru"; 
-int port=8283;
+// Format current local time with seconds and trailing space for log prefix
+// Форматировать текущее локальное время (для префикса в логе)
+String getTimeString() {
+  time_t now = time(nullptr);
+  if (now < 100000) return String("[no time] ");
+  struct tm *tm_info = localtime(&now);
+  if (!tm_info) return String("[no time] ");
+  char buf[24];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S ", tm_info);
+  return String(buf);
+}
 
-const unsigned long postingInterval = SEND_INTERVAL; 
-unsigned long lastConnectionTime = 0;                   
-boolean lastConnected = false;                          
-unsigned long cur_mark;
+// Format arbitrary UTC time to local string (for JSON/HTML)
+// Форматировать произвольное время UTC в локальную строку (JSON/HTML)
+String getTimeStringShort(time_t t) {
+  if (t < 100000) return String("");
+  struct tm *tm_info = localtime(&t);
+  if (!tm_info) return String("");
+  char buf[20];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm_info);
+  return String(buf);
+}
 
-//Анемометр
-#define WIND_CORRECTION 0     //Коррекция севера на флюгере в градусах (используется при невозможности сориентировать датчик строго на север)
-#define NO_WINDDIR      4     //Кол-во циклов передачи, необходимое для накопления данных для о направлении ветра
+// Log macro with time prefix and level filtering
+// Макрос логирования с префиксом времени и фильтром по уровню
+#define LOG(level, msg) \
+  do { \
+    if ((level) <= debugLevel) { \
+      String __m = getTimeString() + msg; \
+      if (FORCE_SERIAL_DEBUG || logToSerial) { \
+        Serial.println(__m); \
+      } else { \
+        logToRingBuffer(__m); \
+      } \
+    } \
+  } while (0)
 
-#define  N_OF_THP_SENSORS NOF_132 + NOF_500 + NOF_968 + NOF_129 + NOF_318 + NOF_800 + NOF_THP
-//****************************************************************************************
+// Prototypes
+// Прототипы функций
+void wifi_connect();
+void syncTime();
+bool senddata();
+String buildNarodmonJson();
 
-Oregon_NR oregon(13, 13, 2, true); // Приёмник 433Мгц подключён к D7 (GPIO13), Светодиод на D2 подтянут к +пит.
+void handleRoot();
+void handleReboot();
+void handleJson();
+void handleConfig();
+void handleLog();
 
-//****************************************************************************************
-//Структура для хранения полученных данных от термогигрометров:
-struct BTHGN_sensor
-{
-  bool  isreceived = 0;           //Флаг о том, что по данному каналу приходил хоть один правильный пакет и данные актуальны
-  byte  number_of_receiving = 0;  //сколько пакетов получено в процессе сбора данных
-  unsigned long rcv_time = 7000000;// времена прихода последних пакетов
-  byte  chnl;                     //канал передачи
-  word  type;                     //Тип датчика
-  float temperature;              //Температура
-  float humidity;                 //Влажность. 
-  float pressure;                 //Давление в мм.рт.ст.
-  bool  battery;                  //Флаг батареи
-  float voltage;                  //Напряжение батареи
-};
+void saveLogConfig();
+void loadLogConfig();
 
-BTHGN_sensor t_sensor[N_OF_THP_SENSORS];
-//****************************************************************************************
-//Структура для хранения полученных данных от анемометра:
-struct WGR800_sensor
-{
-  bool  isreceived = 0;           //Флаг о том, что по данному каналу приходил хоть один правильный пакет и данные актуальны
-  byte  number_of_receiving = 0;  //сколько пакетов получено в процессе сбора данных
-  byte  number_of_dir_receiving = 0;  //сколько пакетов получено в процессе сбора данных
-  unsigned long rcv_time = 7000000;// времена прихода последних пакетов
-  
-  float midspeed;                 //Средняя скорость ветра
-  float maxspeed;                 //Порывы ветра
-  float direction_x;              // Направление ветра
-  float direction_y;
-  byte dir_cycle = 0;             //Кол-во циклов накопления данных
-  float dysp_wind_dir = -1;
-  bool  battery;                 //Флаг батареи
-};
+// ---------- HTTP Auth / Авторизация ----------
+bool isAuthorized() {
+  if (!server.authenticate(CONFIG_USER, CONFIG_PASS)) {
+    server.requestAuthentication();
+    return false;
+  }
+  return true;
+}
 
-WGR800_sensor wind_sensor;
+// Common app header with menu
+// Общий заголовок с навигацией
+void addMenuLinks(String &web) {
+  web += "<header class=\"app-bar\">";
+  web += "<div class=\"app-title\">Home Weather</div>";
+  web += "<nav class=\"app-nav\">";
+  web += "<a href=\"/\" class=\"nav-link\">Main</a>";
+  web += "<a href=\"/json\" class=\"nav-link\">JSON</a>";
+  web += "<a href=\"/config\" class=\"nav-link\">Config</a>";
+  web += "<a href=\"/log\" class=\"nav-link\">Log</a>";
+  web += "</nav>";
+  web += "<button id=\"themeToggle\" class=\"icon-button\" aria-label=\"Toggle theme\">🌓</button>";
+  web += "</header>";
+}
 
-//****************************************************************************************
-//Структура для хранения УФ-индекса:
-struct UVN800_sensor
-{
-  bool  isreceived = 0;           //Флаг о том, что по данному каналу приходил хоть один правильный пакет и данные актуальны
-  byte  number_of_receiving = 0;  //сколько пакетов получено в процессе сбора данных
-  unsigned long rcv_time = 7000000;// времена прихода последних пакетов
-  
-  float  index;                     //УФ-индекс
-  bool battery;                    //Флаг батареи
-};
+// ---------- Main page (material-like UI) / Главная страница ----------
+void handleRoot() {
+  String web;
 
-UVN800_sensor uv_sensor;
-//****************************************************************************************
-//Структура для хранения полученных данных от счётчика осадков:
-struct PCR800_sensor
-{
-  bool  isreceived = 0;           //Флаг о том, что по данному каналу приходил хоть один правильный пакет и данные актуальны
-  byte  number_of_receiving = 0;  //сколько пакетов получено в процессе сбора данных
-  unsigned long rcv_time = 7000000;// времена прихода последних пакетов
-  
-  float  rate;                    //Интенсивность осадков
-  float  counter;                 //счётчик осадков
-  bool battery;                   //Флаг батареи
-};
+  web += "<!DOCTYPE html><html><head><meta charset=\"utf-8\">";
+  web += "<title>Home Weather Station</title>";
+  web += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
+  if (refreshMainSec > 0) {
+    // Auto refresh (seconds), configurable in /config
+    // Автообновление страницы (секунды), настраивается в /config
+    web += "<meta http-equiv=\"refresh\" content=\"";
+    web += String(refreshMainSec);
+    web += "\">";
+  }
 
-PCR800_sensor rain_sensor;
-//****************************************************************************************
+  // CSS: dark/light theme + cards layout
+  // CSS: тёмная/светлая тема + карточный layout
+  web += "<style>";
+  web += ":root{--bg-color:#121212;--card-bg:#1E1E1E;--text-color:#E0E0E0;";
+  web += "--accent:#03DAC6;--accent-2:#BB86FC;--error:#CF6679;";
+  web += "--muted:#888;--border-radius:12px;--shadow:0 4px 12px rgba(0,0,0,0.4);}";
+  web += ":root.light{--bg-color:#F5F5F5;--card-bg:#FFFFFF;--text-color:#212121;";
+  web += "--accent:#6200EE;--accent-2:#03DAC6;--error:#B00020;";
+  web += "--muted:#777;--shadow:0 2px 8px rgba(0,0,0,0.15);}";
+  web += "body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Roboto','Segoe UI',sans-serif;";
+  web += "background:var(--bg-color);color:var(--text-color);}";
 
-///////////////////////////////////////////////////////////////////////////////////////////
-// ВебСервер. Основная страница
-void headroot(void) // Процедура обработки запроса GET , "/"
- {
-  String  web ="", pref;
+  web += ".app-bar{position:sticky;top:0;z-index:10;display:flex;align-items:center;";
+  web += "justify-content:space-between;padding:8px 16px;background:rgba(18,18,18,0.9);";
+  web += "backdrop-filter:blur(8px);border-bottom:1px solid rgba(255,255,255,0.06);}";
+  web += ".light .app-bar{background:rgba(245,245,245,0.9);}";
 
-  web +="<html>";
-  web +="<head>";
-  web +="<meta charset='utf-8'>";
-  web +="<title>Home Weather Station</title>";
-  web +="<meta http-equiv='refresh' content='10'>";
-  web +="<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  web +="<link href='https://fonts.googleapis.com/css?family=Open+Sans:300,400,600' rel='stylesheet'>";
-  web +="<style>";
-  web +="html { font-family: 'Open Sans', sans-serif; display: block; margin: 0px auto; text-align: center;color: #444444;}";
-  web +="body{margin: 0px;} ";
-  web +="h1 {margin: 50px auto 30px;} ";
-  web +=".side-by-side{display: table-cell;vertical-align: middle;position: relative;}";
-  web +=".text{font-weight: 600;font-size: 19px;width: 200px;}";
-  web +=".reading{font-weight: 300;font-size: 50px;padding-right: 25px;}";
-  web +=".temperature .reading{color: #F29C1F;}";
-  web +=".humidity .reading{color: #3B97D3;}";
-  web +=".pressure .reading{color: #26B99A;}";
-  web +=".altitude .reading{color: #955BA5;}";
-  web +=".superscript{font-size: 17px;font-weight: 600;position: absolute;top: 10px;}";
-  web +=".data{padding: 10px;}";
-  web +=".container{display: table;margin: 0 auto;}";
-  web +=".icon{width:65px}";
-  web +="</style>";
-  web +="</head>";
-  web +="<body>";
-  web +="<h1>Home Weather Station</h1>";
-  web +="<div class='container'>";
-  web +="<div class='data pressure'>";
-  web +="<div class='side-by-side icon'>";
-  web +="<svg enable-background='new 0 0 40.542 40.541'height=40.541px id=Layer_1 version=1.1 viewBox='0 0 40.542 40.541'width=40.542px x=0px xml:space=preserve xmlns=http://www.w3.org/2000/svg xmlns:xlink=http://www.w3.org/1999/xlink y=0px><g><path d='M34.313,20.271c0-0.552,0.447-1,1-1h5.178c-0.236-4.841-2.163-9.228-5.214-12.593l-3.425,3.424";
-  web +="c-0.195,0.195-0.451,0.293-0.707,0.293s-0.512-0.098-0.707-0.293c-0.391-0.391-0.391-1.023,0-1.414l3.425-3.424";
-  web +="c-3.375-3.059-7.776-4.987-12.634-5.215c0.015,0.067,0.041,0.13,0.041,0.202v4.687c0,0.552-0.447,1-1,1s-1-0.448-1-1V0.25";
-  web +="c0-0.071,0.026-0.134,0.041-0.202C14.39,0.279,9.936,2.256,6.544,5.385l3.576,3.577c0.391,0.391,0.391,1.024,0,1.414";
-  web +="c-0.195,0.195-0.451,0.293-0.707,0.293s-0.512-0.098-0.707-0.293L5.142,6.812c-2.98,3.348-4.858,7.682-5.092,12.459h4.804";
-  web +="c0.552,0,1,0.448,1,1s-0.448,1-1,1H0.05c0.525,10.728,9.362,19.271,20.22,19.271c10.857,0,19.696-8.543,20.22-19.271h-5.178";
-  web +="C34.76,21.271,34.313,20.823,34.313,20.271z M23.084,22.037c-0.559,1.561-2.274,2.372-3.833,1.814";
-  web +="c-1.561-0.557-2.373-2.272-1.815-3.833c0.372-1.041,1.263-1.737,2.277-1.928L25.2,7.202L22.497,19.05";
-  web +="C23.196,19.843,23.464,20.973,23.084,22.037z'fill=#26B999 /></g></svg>";
-  web +="</div>";
-  web +="<div class='side-by-side text'>Давление</div>";
-  web +="<div class='side-by-side reading'>";
-  web +=bmp.readPressure()/133.3-0.1;
-  web +="<span class='superscript'>мм.рт.ст.</span></div>";
-  web +="</div>";
+  web += ".app-title{font-weight:600;font-size:18px;}";
+  web += ".app-nav{display:flex;gap:8px;}";
+  web += ".nav-link{color:var(--text-color);text-decoration:none;padding:6px 10px;";
+  web += "border-radius:999px;font-size:14px;}";
+  web += ".nav-link:hover{background:rgba(255,255,255,0.06);}";
 
-  web +=sendOregonData(1);
+  web += ".icon-button{border:none;background:transparent;color:var(--text-color);";
+  web += "cursor:pointer;font-size:18px;padding:4px;border-radius:50%;}";
+  web += ".icon-button:hover{background:rgba(255,255,255,0.1);}";
 
-  web +="<div class='data temperature'>";
-  web +="<div class='side-by-side icon'>";
-  web +="<svg enable-background='new 0 0 19.438 54.003'height=54.003px id=Layer_1 version=1.1 viewBox='0 0 19.438 54.003'width=19.438px x=0px xml:space=preserve xmlns=http://www.w3.org/2000/svg xmlns:xlink=http://www.w3.org/1999/xlink y=0px><g>";
-  web +="<path d='M11.976,8.82v-2h4.084V6.063C16.06,2.715,13.345,0,9.996,0H9.313C5.965,0,3.252,2.715,3.252,6.063v30.982";
-  web +="C1.261,38.825,0,41.403,0,44.286c0,5.367,4.351,9.718,9.719,9.718c5.368,0,9.719-4.351,9.719-9.718";
-  web +="c0-2.943-1.312-5.574-3.378-7.355V18.436h-3.914v-2h3.914v-2.808h-4.084v-2h4.084V8.82H11.976z M15.302,44.833";
-  web +="c0,3.083-2.5,5.583-5.583,5.583s-5.583-2.5-5.583-5.583c0-2.279,1.368-4.236,3.326-5.104V24.257C7.462,23.01,8.472,22,9.719,22";
-  web +="s2.257,1.01,2.257,2.257V39.73C13.934,40.597,15.302,42.554,15.302,44.833z'fill=#F29C21 /></g></svg>";
-  web +="</div>";
-  web +="<div class='side-by-side text'>Температура станции</div>";
-  web +="<div class='side-by-side reading'>";
-  web +=bmp.readTemperature();
-  web +="<span class='superscript'>&deg;C</span></div>";
-  web +="</div>";
+  web += ".container{max-width:1000px;margin:12px auto 24px;padding:0 12px;}";
+  web += ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;}";
+  web += ".card{background:var(--card-bg);border-radius:var(--border-radius);padding:14px;";
+  web += "box-shadow:var(--shadow);display:flex;flex-direction:column;gap:4px;}";
+  web += ".card-header{display:flex;justify-content:space-between;align-items:center;}";
+  web += ".card-title{font-size:15px;font-weight:600;}";
+  web += ".chip{font-size:11px;border-radius:999px;padding:2px 8px;border:1px solid var(--muted);color:var(--muted);}";
+  web += ".chip-ok{border-color:var(--accent);color:var(--accent);}";
+  web += ".chip-stale{border-color:var(--error);color:var(--error);}";
+  web += ".value{font-size:26px;font-weight:500;}";
+  web += ".value span{font-size:13px;margin-left:4px;color:var(--muted);}";
+  web += ".meta{font-size:11px;color:var(--muted);}";
+  web += ".section-title{font-size:14px;font-weight:600;margin:16px 4px 8px;opacity:0.9;}";
+  web += ".row{display:flex;justify-content:space-between;font-size:13px;}";
+  web += ".row span:last-child{font-weight:500;}";
+  web += "@media (max-width:600px){.app-title{font-size:16px;} .card{padding:12px;}}";
+  web += "</style>";
 
-/*
-  web +="<div class='data altitude'>";
-  web +="<div class='side-by-side icon'>";
-  web +="<svg enable-background='new 0 0 58.422 40.639'height=40.639px id=Layer_1 version=1.1 viewBox='0 0 58.422 40.639'width=58.422px x=0px xml:space=preserve xmlns=http://www.w3.org/2000/svg xmlns:xlink=http://www.w3.org/1999/xlink y=0px><g><path d='M58.203,37.754l0.007-0.004L42.09,9.935l-0.001,0.001c-0.356-0.543-0.969-0.902-1.667-0.902";
-  web +="c-0.655,0-1.231,0.32-1.595,0.808l-0.011-0.007l-0.039,0.067c-0.021,0.03-0.035,0.063-0.054,0.094L22.78,37.692l0.008,0.004";
-  web +="c-0.149,0.28-0.242,0.594-0.242,0.934c0,1.102,0.894,1.995,1.994,1.995v0.015h31.888c1.101,0,1.994-0.893,1.994-1.994";
-  web +="C58.422,38.323,58.339,38.024,58.203,37.754z'fill=#955BA5 /><path d='M19.704,38.674l-0.013-0.004l13.544-23.522L25.13,1.156l-0.002,0.001C24.671,0.459,23.885,0,22.985,0";
-  web +="c-0.84,0-1.582,0.41-2.051,1.038l-0.016-0.01L20.87,1.114c-0.025,0.039-0.046,0.082-0.068,0.124L0.299,36.851l0.013,0.004";
-  web +="C0.117,37.215,0,37.62,0,38.059c0,1.412,1.147,2.565,2.565,2.565v0.015h16.989c-0.091-0.256-0.149-0.526-0.149-0.813";
-  web +="C19.405,39.407,19.518,39.019,19.704,38.674z'fill=#955BA5 /></g></svg>";
-  web +="</div>";
-  web +="<div class='side-by-side text'>Высота над уровнем моря</div>";
-  web +="<div class='side-by-side reading'>";
-  web +=bmp.readAltitude();
-  web +="<span class='superscript'>м</span></div>";
-  web +="</div>";
-*/
+  // Theme toggle (dark/light) via localStorage
+  // Переключение темы (тёмная/светлая) через localStorage
+  web += "<script>";
+  web += "document.addEventListener('DOMContentLoaded',function(){";
+  web += " const root=document.documentElement;";
+  web += " const saved=localStorage.getItem('theme');";
+  web += " if(saved==='light') root.classList.add('light');";
+  web += " const btn=document.getElementById('themeToggle');";
+  web += " if(btn){btn.addEventListener('click',()=>{";
+  web += "  root.classList.toggle('light');";
+  web += "  localStorage.setItem('theme',root.classList.contains('light')?'light':'dark');";
+  web += " });}";
+  web += "});";
+  web += "</script>";
 
-  // уровень WIFI сигнала
-  int WIFIRSSI=constrain(((WiFi.RSSI()+100)*2),0,100);
-  web +="<div class='data pressure'>";
-  web +="<div class='side-by-side icon'>";
-  web +="<svg version='1.1' id='Layer_1' xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink' x='0px' y='0px'";
-  web +="viewBox='0 0 424.264 424.264' style='enable-background:new 0 0 424.264 424.264;' xml:space='preserve'>";
-  web +="<path style='fill:#2488FF;' d='M212.132,32.132C131.999,32.132,56.663,63.337,0,120l28.284,28.284";
-  web +="c49.107-49.107,114.399-76.152,183.848-76.152s134.74,27.045,183.848,76.152L424.264,120";
-  web +="C367.601,63.337,292.265,32.132,212.132,32.132z'/>";
-  web +="<path style='fill:#2488FF;' d='M56.568,176.568l28.284,28.284c33.998-33.998,79.2-52.721,127.279-52.721";
-  web +="s93.282,18.723,127.279,52.721l28.284-28.284c-41.553-41.553-96.799-64.437-155.563-64.437S98.121,135.016,56.568,176.568z'/>";
-  web +="<path style='fill:#2488FF;' d='M113.137,233.137l28.284,28.284c38.99-38.989,102.432-38.989,141.422,0l28.284-28.284";
-  web +="C256.541,178.551,167.723,178.551,113.137,233.137z'/>";
-  web +="<path style='fill:#2488FF;' d='M152.132,332.132c0,33.084,26.916,60,60,60v-120C179.048,272.132,152.132,299.048,152.132,332.132z'/>";
-  web +="<path style='fill:#005ECE;' d='M212.132,272.132v120c33.084,0,60-26.916,60-60S245.216,272.132,212.132,272.132z'/>";
-  web +="</g></svg>";
-  web +="</div>";
-  web +="<div class='side-by-side text'>Уровень WI-FI (";
-  web +=WiFi.SSID();
-  web +=")</div>";
-  web +="<div class='side-by-side reading'>";
-  web +=WIFIRSSI;
-  web +="<span class='superscript'>dBm</span></div>";
-  web +="</div>";
-  web +="</div>";
+  web += "</head><body>";
 
+  addMenuLinks(web);
+
+  web += "<main class=\"container\">";
+
+  unsigned long nowMs = millis();
+  time_t nowUtc = time(nullptr);
+
+  // --- Oregon sensors section first / Секция Oregon сенсоров первой ---
+  web += "<div class=\"section-title\">Oregon sensors</div>";
+  web += "<div class=\"grid\">";
+
+  for (byte i = 0; i < NOF_132; i++) {
+    if (!tsensor[i].isreceived) continue;
+
+    // In this version we do NOT clear isreceived on timeout.
+    // Здесь мы НЕ сбрасываем isreceived по тайм‑ауту — всегда показываем последнее значение.
+    bool isStale = false;
+    if (tsensor[i].rcvtime > 0) {
+      unsigned long ageMs = nowMs - tsensor[i].rcvtime;
+      // считаем stale, если больше 30 минут, для отображения
+      isStale = (ageMs > 30UL * 60UL * 1000UL);
+    }
+
+    // Reconstruct approximate last receive time in UTC using millis() age
+    time_t lastUtc = 0;
+    if (nowUtc > 100000 && tsensor[i].rcvtime > 0) {
+      unsigned long ageMs = nowMs - tsensor[i].rcvtime;
+      lastUtc = nowUtc - (ageMs / 1000UL);
+    }
+
+    // Human‑readable channel names, as in original sketch:
+    // 1 → Bedroom, 2 → Outdoor, 3 → Channel3
+    String chName = "Channel " + String(tsensor[i].chnl);
+    if (tsensor[i].chnl == 1) chName = "Bedroom";
+    if (tsensor[i].chnl == 2) chName = "Outdoor";
+    if (tsensor[i].chnl == 3) chName = "Channel3";
+
+    web += "<article class=\"card\">";
+    web += "<div class=\"card-header\">";
+    web += "<div class=\"card-title\">";
+    web += chName;
+    web += "</div>";
+    if (isStale) web += "<span class=\"chip chip-stale\">Stale</span>";
+    else web += "<span class=\"chip chip-ok\">Live</span>";
+    web += "</div>";
+
+    web += "<div class=\"value\">";
+    web += String(tsensor[i].temperature, 2);
+    web += "<span>°C</span></div>";
+
+    if (tsensor[i].humidity > 0 && tsensor[i].humidity <= 100) {
+      web += "<div class=\"row\"><span>Humidity</span><span>";
+      web += String(tsensor[i].humidity, 1);
+      web += " %</span></div>";
+    }
+
+    web += "<div class=\"row\"><span>Battery</span><span>";
+    web += (tsensor[i].battery ? "LOW" : "OK");
+    web += "</span></div>";
+
+    web += "<div class=\"meta\">Last update: ";
+    if (lastUtc > 0) web += getTimeStringShort(lastUtc);
+    else web += "unknown";
+    web += "</div>";
+
+    web += "</article>";
+  }
+
+  web += "</div>";  // grid Oregon
+
+  // --- Station (BMP180 + WiFi) ---
+  web += "<div class=\"section-title\">Station</div>";
+  web += "<div class=\"grid\">";
+
+  float press_mm = bmp.readPressure() / 133.3 - 0.1;
+  web += "<article class=\"card\">";
+  web += "<div class=\"card-header\">";
+  web += "<div class=\"card-title\">Pressure (BMP180)</div>";
+  web += "<span class=\"chip chip-ok\">BMP180</span>";
+  web += "</div>";
+  web += "<div class=\"value\">";
+  web += String(press_mm, 2);
+  web += "<span>mmHg</span></div>";
+  web += "</article>";
+
+  web += "<article class=\"card\">";
+  web += "<div class=\"card-header\">";
+  web += "<div class=\"card-title\">Station temp</div>";
+  web += "<span class=\"chip chip-ok\">BMP180</span>";
+  web += "</div>";
+  web += "<div class=\"value\">";
+  web += String(bmp.readTemperature(), 2);
+  web += "<span>°C</span></div>";
+  web += "</article>";
+
+  web += "<article class=\"card\">";
+  web += "<div class=\"card-header\">";
+  web += "<div class=\"card-title\">Altitude</div>";
+  web += "<span class=\"chip chip-ok\">BMP180</span>";
+  web += "</div>";
+  web += "<div class=\"value\">";
+  web += String(bmp.readAltitude(), 1);
+  web += "<span>m</span></div>";
+  web += "</article>";
+
+  int wifiPercent = wifiRssiToPercent(WiFi.RSSI());
+  web += "<article class=\"card\">";
+  web += "<div class=\"card-header\">";
+  web += "<div class=\"card-title\">Wi‑Fi</div>";
+  web += "<span class=\"chip\">";
+  web += WiFi.SSID();
+  web += "</span>";
+  web += "</div>";
+  web += "<div class=\"value\">";
+  web += String(wifiPercent);
+  web += "<span>%</span></div>";
+  web += "<div class=\"meta\">IP: ";
+  web += WiFi.localIP().toString();
+  web += "</div>";
+  web += "</article>";
+
+  web += "</div>";  // grid Station
+
+  // --- System info (uptime + local time) ---
   uint32_t sec = millis() / 1000ul;
-  int timeHours = (sec / 3600ul);
+  int timeHours = sec / 3600ul;
   int timeMins = (sec % 3600ul) / 60ul;
-  int timeSecs = (sec % 3600ul) % 60ul;
-  web +="<br /><br /><h3>Время работы станции: ";
-  web +=timeHours;
-  web +=":";
-  web +=timeMins;
-  web +=":";
-  web +=timeSecs;
-  web +="</h3>";
+  int timeSecs = sec % 60ul;
 
-  web +="<br /><br /><h4><a href='/reboot'>";
-  web +="Reboot";
-  web +="</a></h4>";
-  
-  web +="</body>";
-  web +="</html>"; 
+  web += "<div class=\"section-title\">System</div>";
+  web += "<div class=\"grid\">";
+  web += "<article class=\"card\">";
+  web += "<div class=\"card-header\"><div class=\"card-title\">Uptime</div></div>";
+  web += "<div class=\"value\">";
+  if (timeHours < 10) web += "0";
+  web += String(timeHours);
+  web += ":";
+  if (timeMins < 10) web += "0";
+  web += String(timeMins);
+  web += ":";
+  if (timeSecs < 10) web += "0";
+  web += String(timeSecs);
+  web += "</div>";
+  web += "<div class=\"meta\">Local time: ";
+  web += getTimeStringShort(time(nullptr));
+  web += "</div>";
+  web += "</article>";
+  web += "</div>";
 
- server.send(200, "text/html" , web );
- }
+  web += "</main></body></html>";
 
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//SETUP//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  server.send(200, "text/html", web);
+}
 
-void setup()
-{
-  pinMode(BLUE_LED, OUTPUT);        
-  pinMode(GREEN_LED, OUTPUT);        
-  pinMode(RED_LED, OUTPUT);        
+// ---------- Local JSON API (/json) ----------
+void handleJson() {
+  float bmpTemp = bmp.readTemperature();
+  float bmpPress = bmp.readPressure();
+  float bmpAlt = bmp.readAltitude();
+  int wifiRssi = WiFi.RSSI();
+
+  time_t nowUtc = time(nullptr);
+  unsigned long nowMs = millis();
+
+  String json = "{";
+  json += "\"bmp180\":{";
+  json += "\"temperature\":" + String(bmpTemp, 2) + ",";
+  json += "\"pressure\":" + String(bmpPress, 2) + ",";
+  json += "\"altitude\":" + String(bmpAlt, 1);
+  json += "},";
+
+  json += "\"wifi\":{";
+  json += "\"ssid\":\"" + WiFi.SSID() + "\",";
+  json += "\"rssi\":" + String(wifiRssi) + ",";
+  json += "\"percent\":" + String(wifiRssiToPercent(wifiRssi));
+  json += "},";
+
+  json += "\"oregon\":[";
+  bool first = true;
+  for (byte i = 0; i < NOF_132; i++) {
+    if (!tsensor[i].isreceived) continue;
+
+    bool isStale = false;
+    if (tsensor[i].rcvtime > 0) {
+      unsigned long ageMs = nowMs - tsensor[i].rcvtime;
+      isStale = (ageMs > 30UL * 60UL * 1000UL);
+    }
+
+    time_t lastUtc = 0;
+    if (nowUtc > 100000 && tsensor[i].rcvtime > 0) {
+      unsigned long ageMs = nowMs - tsensor[i].rcvtime;
+      lastUtc = nowUtc - (ageMs / 1000UL);
+    }
+
+    if (!first) json += ",";
+    first = false;
+
+    json += "{";
+    json += "\"channel\":" + String(tsensor[i].chnl) + ",";
+    json += "\"temperature\":" + String(tsensor[i].temperature, 2) + ",";
+    json += "\"humidity\":" + String(tsensor[i].humidity, 2) + ",";
+    json += "\"battery\":" + String(tsensor[i].battery ? 1 : 0) + ",";
+    json += "\"stale\":" + String(isStale ? "true" : "false") + ",";
+    json += "\"last_update\":\"";
+    if (lastUtc > 0) json += getTimeStringShort(lastUtc);
+    json += "\"";
+    json += "}";
+  }
+  json += "]}";
+
+  server.send(200, "application/json", json);
+}
+
+// POST /reboot from /config
+// Принудительная перезагрузка по POST /config (кнопка Reboot)
+void handleReboot() {
+  LOG(0, "Reset via /reboot (POST)");
+  server.send(200, "text/html", "Rebooting");
+  ESP.restart();
+}
+
+// ---------- Config page (/config) ----------
+void handleConfig() {
+  if (!isAuthorized()) return;
+
+  bool updated = false;
+  bool doReboot = false;
+
+  if (server.method() == HTTP_POST) {
+    if (server.hasArg("reboot")) {
+      doReboot = true;
+    }
+
+    if (server.hasArg("level")) {
+      int lvl = server.arg("level").toInt();
+      if (lvl < 0) lvl = 0;
+      if (lvl > 3) lvl = 3;
+      if (debugLevel != (uint8_t)lvl) {
+        debugLevel = (uint8_t)lvl;
+        updated = true;
+      }
+    }
+    if (server.hasArg("target")) {
+      String t = server.arg("target");
+      bool newLogToSerial = logToSerial;
+      if (!FORCE_SERIAL_DEBUG) {
+        newLogToSerial = (t == "serial");
+      } else {
+        newLogToSerial = true;
+      }
+      if (newLogToSerial != logToSerial) {
+        logToSerial = newLogToSerial;
+        updated = true;
+      }
+    }
+    if (server.hasArg("tz")) {
+      int tz = server.arg("tz").toInt();
+      if (tz < -12) tz = -12;
+      if (tz > 14) tz = 14;
+      if (tzOffsetHours != (int8_t)tz) {
+        tzOffsetHours = (int8_t)tz;
+        updated = true;
+        long gmtOffset_sec = (long)tzOffsetHours * 3600L;
+        long daylightOffset_sec = 0;
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+      }
+    }
+    if (server.hasArg("rmain")) {
+      int rm = server.arg("rmain").toInt();
+      if (rm < 0) rm = 0;
+      if (rm > 120) rm = 120;
+      if (refreshMainSec != (uint8_t)rm) {
+        refreshMainSec = (uint8_t)rm;
+        updated = true;
+      }
+    }
+    if (server.hasArg("rlog")) {
+      int rl = server.arg("rlog").toInt();
+      if (rl < 0) rl = 0;
+      if (rl > 120) rl = 120;
+      if (refreshLogSec != (uint8_t)rl) {
+        refreshLogSec = (uint8_t)rl;
+        updated = true;
+      }
+    }
+
+    if (updated) {
+      LOG(1, "Config updated: level=" + String(debugLevel) + " target=" + String(logToSerial ? "Serial" : "Web") + " tz=" + String(tzOffsetHours) + " rMain=" + String(refreshMainSec) + " rLog=" + String(refreshLogSec));
+      saveLogConfig();
+    }
+
+    if (doReboot) {
+      handleReboot();
+      return;
+    }
+  }
+
+  // Simple dark config page (no theme switch here)
+  // Простая тёмная страница для настроек
+  String web;
+  web += "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Config</title>";
+  web += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">";
+  web += "<style>body{font-family:Arial;background:#111;color:#eee;margin:0;padding:0;}"
+         "a{color:#4FC3F7;text-decoration:none;}header{padding:10px 16px;background:#222;margin-bottom:10px;}"
+         "label{display:block;margin-top:10px;}input,select{padding:4px 6px;margin-top:4px;}"
+         "form{padding:0 16px 16px;}button,input[type=submit]{margin-top:10px;padding:6px 12px;border-radius:4px;border:none;background:#4FC3F7;color:#000;}"
+         "h3{margin:16px 16px 4px;}ul{margin:4px 32px 16px;}</style>";
+  web += "</head><body>";
+
+  web += "<header>";
+  web += "<b>Home Weather - Config</b> &nbsp; ";
+  web += "<a href=\"/\">Main</a> | <a href=\"/json\">JSON</a> | <a href=\"/log\">Log</a>";
+  web += "</header>";
+
+  web += "<form method='POST' action='/config'>";
+
+  // Debug level / уровень логирования
+  web += "<label>Debug level (0-3): ";
+  web += "<input type='number' name='level' min='0' max='3' value='";
+  web += String(debugLevel);
+  web += "'></label>";
+
+  // Log target / куда выводить лог
+  web += "<label>Log target:</label>";
+  web += "<label><input type='radio' name='target' value='serial' ";
+  if (logToSerial || FORCE_SERIAL_DEBUG) web += "checked";
+  web += "> Serial</label>";
+  web += "<label><input type='radio' name='target' value='web' ";
+  if (!logToSerial && !FORCE_SERIAL_DEBUG) web += "checked";
+  web += "> Web page</label>";
+
+  if (FORCE_SERIAL_DEBUG) {
+    web += "<p style='color:#FF5252;'>FORCE_SERIAL_DEBUG=1: Serial logging is forced, log target setting is ignored.</p>";
+  }
+
+  // Timezone / Часовой пояс
+  web += "<label>Time zone (GMT offset, hours): ";
+  web += "<input type='number' name='tz' min='-12' max='14' value='";
+  web += String(tzOffsetHours);
+  web += "'></label>";
+
+  // Auto refresh / Автообновление
+  web += "<label>Main page auto refresh (sec, 0 = off): ";
+  web += "<input type='number' name='rmain' min='0' max='120' value='";
+  web += String(refreshMainSec);
+  web += "'></label>";
+
+  web += "<label>Log page auto refresh (sec, 0 = off): ";
+  web += "<input type='number' name='rlog' min='0' max='120' value='";
+  web += String(refreshLogSec);
+  web += "'></label>";
+
+  web += "<p>Current time (device): ";
+  web += getTimeStringShort(time(nullptr));
+  web += "</p>";
+
+  // Logging levels description (EN + RU)
+  web += "<h3>Logging levels</h3>";
+  web += "<ul>";
+  web += "<li>0 - boot, WiFi, critical errors (запуск, Wi‑Fi, критические ошибки)</li>";
+  web += "<li>1 - + narodmon send status (статус отправки на narodmon)</li>";
+  web += "<li>2 - + Oregon sensor data (данные с датчиков Oregon)</li>";
+  web += "<li>3 - + detailed debug, raw packets (подробная отладка, сырые пакеты)</li>";
+  web += "</ul>";
+
+  web += "<button type='submit'>Save</button>";
+
+  web += "<hr><h3>Device</h3>";
+  web += "<button type='submit' name='reboot' value='1' onclick=\"return confirm('Reboot device?');\">Reboot</button>";
+
+  web += "</form>";
+
+  web += "</body></html>";
+  server.send(200, "text/html", web);
+}
+
+// ---------- Log page (/log) ----------
+void handleLog() {
+  if (!isAuthorized()) return;
+
+  String web;
+  web += "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Log</title>";
+  web += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">";
+  if (refreshLogSec > 0) {
+    // Auto refresh for log page / Автообновление страницы логов
+    web += "<meta http-equiv=\"refresh\" content=\"";
+    web += String(refreshLogSec);
+    web += "\">";
+  }
+  web += "<style>body{font-family:monospace;background:#000;color:#0f0;margin:0;}"
+         "header{padding:10px 16px;background:#111;color:#fff;}"
+         "a{color:#4FC3F7;text-decoration:none;}"
+         "pre{white-space:pre-wrap;margin:0;padding:8px 12px;}</style>";
+  web += "</head><body>";
+
+  web += "<header>Home Weather - Log &nbsp;<a href=\"/\">Main</a> | <a href=\"/config\" style=\"color:#4FC3F7;\">Config</a></header>";
+  web += "<pre>";
+  web += getLogBufferString();
+  web += "</pre>";
+  web += "</body></html>";
+
+  server.send(200, "text/html", web);
+}
+
+// ---------- Setup / Loop ----------
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("Start Server");
+
+  loadLogConfig();
+
+  if (FORCE_SERIAL_DEBUG) logToSerial = true;
+
+  LOG(0, "Booting with level=" + String(debugLevel) + " target=" + String(logToSerial ? "Serial" : "Web") + " tz=" + String(tzOffsetHours) + " rMain=" + String(refreshMainSec) + " rLog=" + String(refreshLogSec));
+
+  pinMode(BLUE_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  if (RED_LED != 255) pinMode(RED_LED, OUTPUT);
 
   if (!bmp.begin()) {
-  Serial.println("Could not find a valid BMP085/BMP180 sensor, check wiring!");
-  while (1) {}
+    Serial.println("Could not find a valid BMP085/BMP180 sensor, check wiring!");
+    LOG(0, "BMP180 init failed! Halting.");
+    while (1) { delay(1000); }
   }
-  
-  /////////////////////////////////////////////////////
-  //Запуск Serial-ов
-  Serial.begin(115200);
-  Serial.println("Start Server");
-  Serial.println("");
-  
-  if (TEST_MODE) Serial.println("TEST MODE");
-  
-/////////////////////////////////////////////////////
-//Запуск Wifi
+  LOG(0, "BMP180 init OK");
+
   wifi_connect();
-/////////////////////////////////////////////////////
+  syncTime();
 
-  digitalWrite(BLUE_LED, HIGH);    
-  if (test_narodmon_connection()){
-    digitalWrite(GREEN_LED, HIGH);
-    digitalWrite(RED_LED, LOW);
-  }
-  else {
-    digitalWrite(GREEN_LED, LOW);
-    digitalWrite(RED_LED, HIGH);
-  }
-  //вкючение прослушивания радиоканала  
-  oregon.start(); 
+  oregon.start();
   oregon.receiver_dump = 0;
+  LOG(0, "Oregon receiver started");
 
-//////////////////////////////////////////////////////////////////////
-/* Вебсервер */
-  server.on("/",headroot); // Ответ сервера на запрос главной страницы
-  server.on("/reboot", handle_reboot); // Кнопка ребута
-  server.begin(); //Запуск сервера
-
-//////////////////////////////////////////////////////////////////////
-// MQTT;
-// client.set_callback(callback);
+  server.on("/", handleRoot);
+  server.on("/reboot", handleReboot);  // legacy endpoint / устаревший, но оставлен
+  server.on("/json", handleJson);
+  server.on("/config", handleConfig);
+  server.on("/log", handleLog);
+  server.begin();
+  LOG(0, "HTTP server started");
 }
 
-//////////////////////////////////////////////////////////////////////
-//LOOP//////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////////////////////////////////
-void loop() 
-{
-  //////////////////////////////////////////////////////////////////////
-  //Защита от подвисаний/////////////////////////////////////////
-  //////////////////////////////////////////////////////////////////////  
-  if  (micros() > 0xFFF00000) while ( micros() < 0xFFF00000); //Висим секунду до переполнения
-  if  (millis() > 0xFFFFFC0F) while ( millis() < 0xFFFFFC0F); //Висим секунду до переполнения
+void loop() {
+  // ESP8266 timer wraparound guards (как в AI‑версии)
+  if (micros() == 0xFFF00000)
+    while (micros() == 0xFFF00000)
+      ;
 
+  if (millis() == 0xFFFFFC0F)
+    while (millis() == 0xFFFFFC0F)
+      ;
 
-  //////////////////////////////////////////////////////////////////////
-  //Проверка полученных данных,/////////////////////////////////////////
-  //////////////////////////////////////////////////////////////////////  
-  bool is_a_data_to_send = false;
-  for (int i = 0; i < N_OF_THP_SENSORS; i++){
-    if (t_sensor[i].number_of_receiving) is_a_data_to_send = 1;                 // Есть ли данные для отправки?
+  unsigned long now = millis();
+
+  // Old logic: decide sending only by numberofreceiving>0
+  // Старая логика: отправка только если numberofreceiving>0 по хоть одному датчику
+  bool isadatatosend = false;
+  for (int i = 0; i < NOF_132; i++) {
+    if (tsensor[i].numberofreceiving > 0) {
+      isadatatosend = true;
+      break;
+    }
   }
-   if (wind_sensor.number_of_receiving) is_a_data_to_send = 1;                 // Есть ли данные для отправки?
-   if (rain_sensor.number_of_receiving) is_a_data_to_send = 1;                 // Есть ли данные для отправки?
-   if (uv_sensor.number_of_receiving) is_a_data_to_send = 1;                 // Есть ли данные для отправки?
-  //////////////////////////////////////////////////////////////////////
-  //Отправка данных на narodmon.ru/////////////////////////////////////
-  //////////////////////////////////////////////////////////////////////  
-  
-  if (millis() - lastConnectionTime > postingInterval && is_a_data_to_send)  {
 
-    if (is_a_data_to_send)
-    {
-    //Обязательно отключить прослушивание канала
+  // Periodic send to narodmon.ru
+  // Периодическая отправка данных на narodmon.ru
+  if ((now - lastConnectionTime > postingInterval) && isadatatosend) {
     oregon.stop();
-
-//////////////////////////////////////////////////////////////////////////////////////////////////
-// Отправляем MQTT
-   mqtt_send();
-//////////////////////////////////////////////////////////////////////////////////////////////////    
-
-    digitalWrite(BLUE_LED, HIGH);    
-    if (send_data()){
+    digitalWrite(BLUE_LED, HIGH);
+    LOG(1, "Sending data to narodmon...");
+    if (senddata()) {
       digitalWrite(GREEN_LED, HIGH);
       digitalWrite(RED_LED, LOW);
-    }
-    else {
+      LOG(1, "Send OK");
+    } else {
       digitalWrite(GREEN_LED, LOW);
       digitalWrite(RED_LED, HIGH);
+      LOG(1, "Send FAILED");
     }
-
     oregon.start();
-    oregon.receiver_dump = 0;    
-    }
-    else Serial.println("No data to send");
+    oregon.receiver_dump = 0;
   }
 
-  //////////////////////////////////////////////////////////////////////
-  //Захват пакета,//////////////////////////////////////////////
-  //////////////////////////////////////////////////////////////////////  
-  oregon.capture(0);
-  //
-  //Захваченные данные годны до следующего вызова capture
-  //////////////////////////////////////////////////////////////////////
-  //ОБработка полученного пакета
-  //////////////////////////////////////////////
-  if (oregon.captured)  
-  {
+  // Capture Oregon frames
+  // Приём пакетов от датчиков Oregon
+  oregon.capture(false);
+  if (oregon.captured) {
     yield();
-    //Вывод информации в Serial
-    Serial.print ((float) millis() / 1000, 1); //Время
-    Serial.print ("s\t\t");
-    //Версия протокола
-    if (oregon.ver == 2) Serial.print("  ");
-    if (oregon.ver == 3) Serial.print("3 ");
-    
-    //Информация о восстановлени пакета
-    if (oregon.restore_sign & 0x01) Serial.print("s"); //восстановлены одиночные такты
-    else  Serial.print(" ");
-    if (oregon.restore_sign & 0x02) Serial.print("d"); //восстановлены двойные такты
-    else  Serial.print(" ");
-    if (oregon.restore_sign & 0x04) Serial.print("p "); //исправленна ошибка при распознавании версии пакета
-    else  Serial.print("  ");
-    if (oregon.restore_sign & 0x08) Serial.print("r "); //собран из двух пакетов (для режима сборки в v.2)
-    else  Serial.print("  ");
 
-    //Вывод полученного пакета.
-    for (int q = 0;q < oregon.packet_length; q++)
-      if (oregon.valid_p[q] == 0x0F) Serial.print(oregon.packet[q], HEX);
-      else Serial.print(" ");
-        
-    //Время обработки пакета
-    Serial.print("  ");
-    Serial.print(oregon.work_time);
-    Serial.print("ms ");
-    
-    if ((oregon.sens_type == THGN132 ||
-    (oregon.sens_type & 0x0FFF) == RTGN318 ||
-    (oregon.sens_type & 0x0FFF) == RTHN318 ||
-    oregon.sens_type == THGR810 ||
-    oregon.sens_type == THN132 ||
-    oregon.sens_type == THN800 ||
-    oregon.sens_type == BTHGN129 ||
-    oregon.sens_type == BTHR968 ||
-    oregon.sens_type == THGN500) && oregon.crc_c)
-    {
-      Serial.print("\t");
-      if (oregon.sens_type == THGN132) Serial.print("THGN132N");
-      if (oregon.sens_type == THGN500) Serial.print("THGN500 ");
-      if (oregon.sens_type == THGR810) Serial.print("THGR810 ");
-      if ((oregon.sens_type & 0x0FFF) == RTGN318) Serial.print("RTGN318 ");
-      if ((oregon.sens_type & 0x0FFF) == RTHN318) Serial.print("RTHN318 ");
-      if (oregon.sens_type == THN132 ) Serial.print("THN132N ");
-      if (oregon.sens_type == THN800 ) Serial.print("THN800  ");
-      if (oregon.sens_type == BTHGN129 ) Serial.print("BTHGN129");
-      if (oregon.sens_type == BTHR968 ) Serial.print("BTHR968 ");
-
-      if (oregon.sens_type != BTHR968 && oregon.sens_type != THGN500)
-      {
-        Serial.print(" CHNL: ");
-        Serial.print(oregon.sens_chnl);
+    if (debugLevel >= 3) {
+      String s = String((float)now / 1000, 1) + " s ";
+      if (oregon.ver == 2) s += "2 ";
+      if (oregon.ver == 3) s += "3 ";
+      s += "pkt=";
+      for (int q = 0; q < oregon.packet_length; q++) {
+        if (oregon.valid_p[q] == 0x0F) s += String(oregon.packet[q], HEX);
+        else s += ".";
       }
-      else Serial.print("        ");
-      Serial.print(" BAT: ");
-      if (oregon.sens_battery) Serial.print("F "); else Serial.print("e ");
-      Serial.print("ID: ");
-      Serial.print(oregon.sens_id, HEX);
-      
-      if (oregon.sens_tmp >= 0 && oregon.sens_tmp < 10) Serial.print(" TMP:  ");
-      if (oregon.sens_tmp < 0 && oregon.sens_tmp >-10) Serial.print(" TMP: ");
-      if (oregon.sens_tmp <= -10) Serial.print(" TMP:");
-      if (oregon.sens_tmp >= 10) Serial.print(" TMP: ");
-      Serial.print(oregon.sens_tmp, 1);
-      Serial.print("C ");
-      if (oregon.sens_type == THGN132 ||
-          oregon.sens_type == THGR810 ||
-          oregon.sens_type == BTHGN129 ||
-          oregon.sens_type == BTHR968 ||
-          (oregon.sens_type & 0x0FFF) == RTGN318 ||
-          oregon.sens_type == THGN500 ) {
-        Serial.print("HUM: ");
-        Serial.print(oregon.sens_hmdty, 0);
-        Serial.print("%");
-      }
-      else Serial.print("        ");
-
-      if (oregon.sens_type == BTHGN129 ||  oregon.sens_type == BTHR968)
-      {
-      Serial.print(" PRESS: ");
-      Serial.print(oregon.get_pressure(), 1);
-      Serial.print("Hgmm ");
-      }
-
-      if (oregon.sens_type == THGN132 && oregon.sens_chnl > NOF_132) {Serial.println(); return;}
-      if (oregon.sens_type == THGN500 && NOF_500 == 0) {Serial.println(); return;}
-      if (oregon.sens_type == BTHR968 && NOF_968 == 0) {Serial.println(); return;}
-      if (oregon.sens_type == THGR810 && oregon.sens_chnl > NOF_800) {Serial.println(); return;}
-      if (oregon.sens_type == BTHGN129 && oregon.sens_chnl > NOF_129) {Serial.println(); return;}
-      if ((oregon.sens_type & 0x0FFF) == RTGN318 && oregon.sens_chnl > NOF_318) {Serial.println(); return;}
-      
-      byte _chnl = oregon.sens_chnl - 1;
-           
-      if (oregon.sens_type == THGN500) _chnl = NOF_132;
-      if (oregon.sens_type == BTHR968 ) _chnl = NOF_132 + NOF_500; 
-      if (oregon.sens_type == BTHGN129 ) _chnl = NOF_132 + NOF_500 + NOF_968; 
-      if (oregon.sens_type == THGR810 || oregon.sens_type == THN800) _chnl = NOF_132 + NOF_500 + NOF_968 + NOF_129;
-      if ((oregon.sens_type & 0x0FFF) == RTGN318 || (oregon.sens_type & 0x0FFF) == RTHN318) _chnl  = NOF_132 + NOF_500 + NOF_968 + NOF_129 + NOF_800;
-
-      t_sensor[ _chnl].chnl = oregon.sens_chnl;
-      t_sensor[ _chnl].number_of_receiving++;
-      t_sensor[ _chnl].type = oregon.sens_type;
-      t_sensor[ _chnl].battery = oregon.sens_battery;
-      t_sensor[ _chnl].pressure = t_sensor[ _chnl].pressure * ((float)(t_sensor[ _chnl].number_of_receiving - 1) / (float)t_sensor[ _chnl].number_of_receiving) + oregon.get_pressure() / t_sensor[ _chnl].number_of_receiving;
-      t_sensor[ _chnl].temperature = t_sensor[ _chnl].temperature * ((float)(t_sensor[ _chnl].number_of_receiving - 1) / (float)t_sensor[ _chnl].number_of_receiving) + oregon.sens_tmp / t_sensor[ _chnl].number_of_receiving;
-      t_sensor[ _chnl].humidity = t_sensor[ _chnl].humidity * ((float)(t_sensor[ _chnl].number_of_receiving - 1) / (float)t_sensor[ _chnl].number_of_receiving) + oregon.sens_hmdty / t_sensor[ _chnl].number_of_receiving;
-      t_sensor[ _chnl].rcv_time = millis();         
+      s += " time=" + String(oregon.work_time) + " ms";
+      LOG(3, s);
     }
-    
-    if (oregon.sens_type == PCR800 && oregon.crc_c)
-    {
-      Serial.print("\tPCR800  ");
-      Serial.print("        ");
-      Serial.print(" BAT: ");
-      if (oregon.sens_battery) Serial.print("F "); else Serial.print("e ");
-      Serial.print(" ID: ");
-      Serial.print(oregon.sens_id, HEX);
-      Serial.print("   TOTAL: ");
-      Serial.print(oregon.get_total_rain(), 1);
-      Serial.print("mm  RATE: ");
-      Serial.print(oregon.get_rain_rate(), 1);
-      Serial.print("mm/h");
-      rain_sensor.number_of_receiving++;
-      rain_sensor.battery = oregon.sens_battery;
-      rain_sensor.rate = oregon.get_rain_rate();
-      rain_sensor.counter = oregon.get_total_rain();
-      rain_sensor.rcv_time = millis();         
-    }    
-    
-  if (oregon.sens_type == WGR800 && oregon.crc_c){
-      Serial.print("\tWGR800  ");
-      Serial.print("        ");
-      Serial.print(" BAT: ");
-      if (oregon.sens_battery) Serial.print("F "); else Serial.print("e ");
-      Serial.print("ID: ");
-      Serial.print(oregon.sens_id, HEX);
-      
-      Serial.print(" AVG: ");
-      Serial.print(oregon.sens_avg_ws, 1);
-      Serial.print("m/s  MAX: ");
-      Serial.print(oregon.sens_max_ws, 1);
-      Serial.print("m/s  DIR: "); //N = 0, E = 4, S = 8, W = 12
-      switch (oregon.sens_wdir)
-      {
-      case 0: Serial.print("N"); break;
-      case 1: Serial.print("NNE"); break;
-      case 2: Serial.print("NE"); break;
-      case 3: Serial.print("NEE"); break;
-      case 4: Serial.print("E"); break;
-      case 5: Serial.print("SEE"); break;
-      case 6: Serial.print("SE"); break;
-      case 7: Serial.print("SSE"); break;
-      case 8: Serial.print("S"); break;
-      case 9: Serial.print("SSW"); break;
-      case 10: Serial.print("SW"); break;
-      case 11: Serial.print("SWW"); break;
-      case 12: Serial.print("W"); break;
-      case 13: Serial.print("NWW"); break;
-      case 14: Serial.print("NW"); break;
-      case 15: Serial.print("NNW"); break;
-      }
 
-      wind_sensor.battery = oregon.sens_battery;
-      wind_sensor.number_of_receiving++;
-      wind_sensor.number_of_dir_receiving++;
-            
-      //Средняя скорость
-      wind_sensor.midspeed = wind_sensor.midspeed * (((float)wind_sensor.number_of_receiving - 1) / (float)wind_sensor.number_of_receiving) + oregon.sens_avg_ws / wind_sensor.number_of_receiving;
-      
-      //Порывы
-      if (oregon.sens_max_ws > wind_sensor.maxspeed || wind_sensor.number_of_receiving == 1) wind_sensor.maxspeed = oregon.sens_max_ws;
-      
-      //Направление
-      //Вычисляется вектор - его направление и модуль.
-      if (wind_sensor.number_of_dir_receiving == 1 && (wind_sensor.direction_x != 0 || wind_sensor.direction_x != 0))
-      {
-        float wdiv = sqrt((wind_sensor.direction_x * wind_sensor.direction_x) + (wind_sensor.direction_y * wind_sensor.direction_y));
-        wind_sensor.direction_x /= wdiv;
-        wind_sensor.direction_y /= wdiv;
-      }
-      
-      float wind_module = 1;
-      if (oregon.sens_wdir == 0) {
-        wind_sensor.direction_x += 1 * wind_module;
-      }
-      if (oregon.sens_wdir == 1) {
-        wind_sensor.direction_x += 0.92 * wind_module;
-        wind_sensor.direction_y -= 0.38 * wind_module;
-      }
-      if (oregon.sens_wdir == 2) {
-        wind_sensor.direction_x += 0.71 * wind_module;
-        wind_sensor.direction_y -= 0.71 * wind_module;
-      }
-      if (oregon.sens_wdir == 3) {
-        wind_sensor.direction_x += 0.38 * wind_module;
-        wind_sensor.direction_y -= 0.92 * wind_module;
-      }
-      if (oregon.sens_wdir == 4) {
-        wind_sensor.direction_y -= 1 * wind_module;
-      }
-      
-      if (oregon.sens_wdir == 5) {
-        wind_sensor.direction_x -= 0.38 * wind_module;
-        wind_sensor.direction_y -= 0.92 * wind_module;
-      }
-      if (oregon.sens_wdir == 6) {
-        wind_sensor.direction_x -= 0.71 * wind_module;
-        wind_sensor.direction_y -= 0.71 * wind_module;
-      }
-      if (oregon.sens_wdir == 7) {
-        wind_sensor.direction_x -= 0.92 * wind_module;
-        wind_sensor.direction_y -= 0.38 * wind_module;
-      }
-      if (oregon.sens_wdir == 8) {
-        wind_sensor.direction_x -= 1 * wind_module;
-      }
-      if (oregon.sens_wdir == 9) {
-        wind_sensor.direction_x -= 0.92 * wind_module;
-        wind_sensor.direction_y += 0.38 * wind_module;
-      }
-      if (oregon.sens_wdir == 10) {
-        wind_sensor.direction_x -= 0.71 * wind_module;
-        wind_sensor.direction_y += 0.71 * wind_module;
-      
-      }
-      if (oregon.sens_wdir == 11) {
-        wind_sensor.direction_x -= 0.38 * wind_module;
-        wind_sensor.direction_y += 0.92 * wind_module;
-      }
-      if (oregon.sens_wdir == 12) {
-        wind_sensor.direction_y += 1 * wind_module;
-      }
-      if (oregon.sens_wdir == 13) {
-        wind_sensor.direction_x += 0.38 * wind_module;
-        wind_sensor.direction_y += 0.92 * wind_module;
-      }
-      if (oregon.sens_wdir == 14) {
-        wind_sensor.direction_x += 0.71 * wind_module;
-        wind_sensor.direction_y += 0.71 * wind_module;
-      }
-      if (oregon.sens_wdir == 15) {
-        wind_sensor.direction_x += 0.92 * wind_module;
-        wind_sensor.direction_y += 0.38 * wind_module;
-      }
-        wind_sensor.rcv_time = millis();
-    }    
-
-    if (oregon.sens_type == UVN800 && oregon.crc_c)
-    {
-      Serial.print("\tUVN800  ");
-      Serial.print("        ");
-      Serial.print(" BAT: ");
-      if (oregon.sens_battery) Serial.print("F "); else Serial.print("e ");
-      Serial.print("ID: ");
-      Serial.print(oregon.sens_id, HEX);
-      
-      Serial.print(" UV IDX: ");
-      Serial.print(oregon.UV_index);
-      
-      uv_sensor.number_of_receiving++;
-      uv_sensor.battery = oregon.sens_battery;
-      uv_sensor.index = uv_sensor.index * ((float)(uv_sensor.number_of_receiving - 1) / (float)uv_sensor.number_of_receiving) + oregon.UV_index / uv_sensor.number_of_receiving;
-      uv_sensor.rcv_time = millis();         
-    }    
-
-    if (oregon.sens_type == RFCLOCK && oregon.crc_c){
-      Serial.print("\tRF CLOCK");
-      Serial.print(" CHNL: ");
-      Serial.print(oregon.sens_chnl);
-      Serial.print(" BAT: ");
-      if (oregon.sens_battery) Serial.print("F "); else Serial.print("e ");
-      Serial.print("ID: ");
-      Serial.print(oregon.sens_id, HEX);
-      Serial.print(" TIME: ");
-      Serial.print(oregon.packet[6] & 0x0F, HEX);
-      Serial.print(oregon.packet[6] & 0xF0 >> 4, HEX);
-      Serial.print(':');
-      Serial.print(oregon.packet[5] & 0x0F, HEX);
-      Serial.print(oregon.packet[5] & 0xF0 >> 4, HEX);
-      Serial.print(':');
-      Serial.print(':');
-      Serial.print(oregon.packet[4] & 0x0F, HEX);
-      Serial.print(oregon.packet[4] & 0xF0 >> 4, HEX);
-      Serial.print(" DATE: ");
-      Serial.print(oregon.packet[7] & 0x0F, HEX);
-      Serial.print(oregon.packet[7] & 0xF0 >> 4, HEX);
-      Serial.print('.');
-      if (oregon.packet[8] & 0x0F ==1 || oregon.packet[8] & 0x0F ==3)   Serial.print('1');
-      else Serial.print('0');
-      Serial.print(oregon.packet[8] & 0xF0 >> 4, HEX);
-      Serial.print('.');
-      Serial.print(oregon.packet[9] & 0x0F, HEX);
-      Serial.print(oregon.packet[9] & 0xF0 >> 4, HEX);
-      
-    }    
-
-    if (oregon.sens_type == PCR800 && oregon.crc_c){
-      Serial.print("\tPCR800  ");
-      Serial.print("        ");
-      Serial.print(" BAT: ");
-      if (oregon.sens_battery) Serial.print("F "); else Serial.print("e ");
-      Serial.print(" ID: ");
-      Serial.print(oregon.sens_id, HEX);
-      Serial.print("   TOTAL: ");
-      Serial.print(oregon.get_total_rain(), 1);
-      Serial.print("mm  RATE: ");
-      Serial.print(oregon.get_rain_rate(), 1);
-      Serial.print("mm/h");
-      
-    }    
-    
-#if ADD_SENS_SUPPORT == 1
-      if ((oregon.sens_type & 0xFF00) == THP && oregon.crc_c) {
-      Serial.print("\tTHP     ");
-      Serial.print(" CHNL: ");
-      Serial.print(oregon.sens_chnl);
-      Serial.print(" BAT: ");
-      Serial.print(oregon.sens_voltage, 2);
-      Serial.print("V");
-      if (oregon.sens_tmp > 0 && oregon.sens_tmp < 10) Serial.print(" TMP:  ");
-      if (oregon.sens_tmp < 0 && oregon.sens_tmp > -10) Serial.print(" TMP: ");
-      if (oregon.sens_tmp <= -10) Serial.print(" TMP:");
-      if (oregon.sens_tmp >= 10) Serial.print(" TMP: ");
-      Serial.print(oregon.sens_tmp, 1);
-      Serial.print("C ");
-      Serial.print("HUM: ");
-      Serial.print(oregon.sens_hmdty, 1);
-      Serial.print("% ");
-      Serial.print("PRESS: ");
-      Serial.print(oregon.sens_pressure, 1);
-      Serial.print("Hgmm");
-      yield();
-
-      if (oregon.sens_chnl > NOF_THP - 1) {Serial.println(); return;}
-      
-      byte _chnl = oregon.sens_chnl  + NOF_132 + NOF_500 + NOF_968 + NOF_129 + NOF_800 + NOF_318;
-      t_sensor[ _chnl].chnl = oregon.sens_chnl + 1;
-      t_sensor[ _chnl].number_of_receiving++;
-      t_sensor[ _chnl].type = oregon.sens_type;
-      t_sensor[ _chnl].pressure = t_sensor[ _chnl].pressure * ((float)(t_sensor[ _chnl].number_of_receiving - 1) / (float)t_sensor[ _chnl].number_of_receiving) + oregon.sens_pressure / t_sensor[ _chnl].number_of_receiving;
-      t_sensor[ _chnl].temperature = t_sensor[ _chnl].temperature * ((float)(t_sensor[ _chnl].number_of_receiving - 1) / (float)t_sensor[ _chnl].number_of_receiving) + oregon.sens_tmp / t_sensor[ _chnl].number_of_receiving;
-      t_sensor[ _chnl].humidity = t_sensor[ _chnl].humidity * ((float)(t_sensor[ _chnl].number_of_receiving - 1) / (float)t_sensor[ _chnl].number_of_receiving) + oregon.sens_hmdty / t_sensor[ _chnl].number_of_receiving;
-      t_sensor[ _chnl].voltage = t_sensor[ _chnl].voltage * ((float)(t_sensor[ _chnl].number_of_receiving - 1) / (float)t_sensor[ _chnl].number_of_receiving) + oregon.sens_voltage / t_sensor[ _chnl].number_of_receiving;
-      t_sensor[ _chnl].rcv_time = millis();         
+    if (oregon.sens_type != THGN132 && oregon.sens_type != THN132) {
+      LOG(3, "Unknown sensor type, skip");
+      goto end_capture;
     }
-#endif
-    Serial.println();
+
+    if (debugLevel >= 2) {
+      String s = "Oregon: CHNL " + String(oregon.sens_chnl);
+      s += " BAT ";
+      s += (oregon.sens_battery ? "F " : "E ");
+      s += "ID ";
+      s += String(oregon.sens_id, HEX);
+      s += " TMP ";
+      s += String(oregon.sens_tmp, 2);
+      s += "C HUM ";
+      s += String(oregon.sens_hmdty, 2);
+      LOG(2, s);
+    }
+
+    if (oregon.sens_chnl > 0 && oregon.sens_chnl <= NOF_132) {
+      byte chnl = oregon.sens_chnl - 1;
+      tsensor[chnl].chnl = oregon.sens_chnl;
+      tsensor[chnl].type = oregon.sens_type;
+      tsensor[chnl].battery = oregon.sens_battery;
+
+      // Keep AI‑style smoothing; doesn’t affect reception, only values.
+      // Сохраняем экспоненциальное сглаживание; на приём не влияет.
+      if (tsensor[chnl].numberofreceiving == 0) {
+        tsensor[chnl].temperature = oregon.sens_tmp;
+        tsensor[chnl].humidity = oregon.sens_hmdty;
+      } else {
+        tsensor[chnl].temperature =
+          SMOOTH_ALPHA * oregon.sens_tmp + (1.0f - SMOOTH_ALPHA) * tsensor[chnl].temperature;
+        tsensor[chnl].humidity =
+          SMOOTH_ALPHA * oregon.sens_hmdty + (1.0f - SMOOTH_ALPHA) * tsensor[chnl].humidity;
+      }
+
+      tsensor[chnl].numberofreceiving++;
+      tsensor[chnl].rcvtime = now;
+      tsensor[chnl].isreceived = true;
+    }
   }
-  yield();
-/*/////////////////////////////////////////////////////////////////////
-// ВебСервер. обработка текущих входящих HTTP-запросов  *//////////////
-  server.handleClient(); 
+end_capture:
+
+  server.handleClient();
 }
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-//***************************************************************************************************************************************
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// ---------- WiFi connect ----------
 void wifi_connect() {
-  
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.print(ssid);
-  unsigned long cur_mark = millis();
-  bool blink = 0;
-  //WiFi.config(ip, gateway, subnet); 
-  WiFi.mode(WIFI_STA); // Задаем режим работы WIFI_STA (клиент)
+  unsigned long curmark = millis();
+  bool blink = false;
+
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  do {
-      while (WiFi.status() != WL_CONNECTED) {
-      if (blink) {
-        digitalWrite(BLUE_LED, LOW);
-      }
-      else {
-        digitalWrite(BLUE_LED, HIGH);
-      }
-      blink = !blink;
-      delay(500);
-      Serial.print(".");
-      //Подключаемся слишком долго. Переподключаемся....
-      if ((millis() - cur_mark) > CONNECT_TIMEOUT){
-        blink = 0; 
-        digitalWrite(BLUE_LED, HIGH);
-        WiFi.disconnect();
-        delay(3000);
-        cur_mark = millis();
-        WiFi.begin(ssid, password);
-      }
+
+  LOG(0, "Connecting to " + String(ssid));
+
+  while (WiFi.status() != WL_CONNECTED) {
+    if (blink) digitalWrite(BLUE_LED, LOW);
+    else digitalWrite(BLUE_LED, HIGH);
+    blink = !blink;
+    delay(500);
+
+    if (millis() - curmark > CONNECTTIMEOUT) {
+      blink = false;
+      digitalWrite(BLUE_LED, HIGH);
+      WiFi.disconnect();
+      delay(3000);
+      curmark = millis();
+      WiFi.begin(ssid, password);
+      LOG(0, "Reconnect to " + String(ssid));
     }
-  } while (WiFi.status() != WL_CONNECTED);
-
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println(WiFi.localIP());
-}
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-bool test_narodmon_connection() {
-  if (TEST_MODE) return true;
-  if (wclient.connect(nardomon_server, port)) {  
-    wclient.println("##");
-    cur_mark = millis();
-    do {
-      wait_timer(10);
-      if ((millis() - cur_mark) > CONNECT_TIMEOUT) {
-        Serial.println("narodmon.ru is not responding");
-        wclient.stop();
-        return 0;
-      }
-    } while (!wclient.connected());
-    Serial.println("narodmon.ru is attainable");
-    wclient.stop();
-    return 1;
-  } 
-  else {
-    Serial.println("connection to narodmon.ru failed");
-    wclient.stop();
-    return 0;
   }
-}
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Отсылка данных на narodmon
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-bool send_data() {
 
-  wind_sensor.dir_cycle++;   //Накапливаем циклы для расчёта направления ветра
-  //Если соединения с сервером нет, по переподключаемся
+  LOG(0, "WiFi connected, IP=" + WiFi.localIP().toString());
+}
+
+// ---------- NTP time sync ----------
+void syncTime() {
+  long gmtOffset_sec = (long)tzOffsetHours * 3600L;
+  long daylightOffset_sec = 0;
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  LOG(0, "Syncing time via NTP, tz=" + String(tzOffsetHours));
+  for (int i = 0; i < 10; i++) {
+    time_t now = time(nullptr);
+    if (now > 100000) {
+      LOG(0, "Time synced: " + getTimeString());
+      return;
+    }
+    delay(500);
+  }
+  LOG(1, "Time sync failed");
+}
+
+// ---------- Send data to narodmon (HTTP JSON) ----------
+bool senddata() {
   if (WiFi.status() != WL_CONNECTED) wifi_connect();
 
-  bool what_return = false;
-  bool is_connect = true;
-  if (!TEST_MODE) is_connect = wclient.connect(nardomon_server, port);
-  
-  if (is_connect) {  
-    //Отправляем MAC-адрес
-    Serial.println(' ');
-    String s = "#";
-           s += mac;
-    Serial.println(s);
-    if (!TEST_MODE) wclient.println(s);
-    //Отправляем данные Oregon
-    sendOregonData(2);
-    // Отправляем mqtt
-        
-    //Завершаем передачу
-    if (!TEST_MODE) wclient.println("##");
-    Serial.println("##");
-    //Ждём отключения клиента
-    cur_mark = millis();
-    if (!TEST_MODE)
-    {
-      do 
-      {
-        yield();
-        if (millis() > cur_mark + DISCONNECT_TIMEOUT) break;
-      }
-      while (!wclient.connected());
-    } 
-     
-    Serial.println(' ');
-    if (!TEST_MODE) wclient.stop();
-    what_return = true;
-  } 
-  else {
-    Serial.println("connection to narodmon.ru failed");
-    if (!TEST_MODE) wclient.stop();
+  String json = buildNarodmonJson();
+  LOG(3, "Narodmon JSON:\n" + json);
+
+  if (TESTMODE) {
+    lastConnectionTime = millis();
+    for (int i = 0; i < NOF_132; i++) tsensor[i].numberofreceiving = 0;
+    return true;
   }
+
+  if (!narodClient.connect("narodmon.ru", 80)) {
+    LOG(1, "connection to narodmon.ru failed");
+    return false;
+  }
+
+  String req = String("POST /json HTTP/1.0\r\n") + "Host: narodmon.ru\r\n" + "Content-Type: application/x-www-form-urlencoded\r\n" + "Content-Length: " + String(json.length()) + "\r\n\r\n" + json;
+
+  narodClient.print(req);
+
+  unsigned long curmark = millis();
+  while (!narodClient.available()) {
+    if (millis() - curmark > DISCONNECTTIMEOUT) {
+      LOG(1, "narodmon.ru no response");
+      narodClient.stop();
+      return false;
+    }
+    delay(10);
+  }
+
+  String response;
+  while (narodClient.available()) {
+    response += narodClient.readString();
+  }
+  narodClient.stop();
+  LOG(1, "Narodmon response:\n" + response);
+
   lastConnectionTime = millis();
-  
-///////////////////////////////////////////////////////////////////////////
-  //Обнуляем флаги полученных данных
-  for (int i = 0; i < N_OF_THP_SENSORS; i++) 
-    t_sensor[i].number_of_receiving = 0;
-////////////////////////////////////////////////////////////////////////////
+  // сбрасываем только счётчики для усреднения, как в оригинале
+  for (int i = 0; i < NOF_132; i++) tsensor[i].numberofreceiving = 0;
 
-  if (wind_sensor.dir_cycle >= NO_WINDDIR)
-  {
-    wind_sensor.number_of_dir_receiving = 0;  
-    wind_sensor.dir_cycle = 0;
+  if (response.indexOf("\"error\":\"OK\"") >= 0) {
+    return true;
   }
-    
-  rain_sensor.number_of_receiving = 0;
-  wind_sensor.number_of_receiving = 0;
-  uv_sensor.number_of_receiving = 0;
-  wind_sensor.number_of_receiving = 0; 
-  
-  
-  return what_return;
-}
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-String sendOregonData(int flag) 
-{
-  String s = "", pref;
-  String  web1 ="";
-  String chanel ="";
-  String chanel1 ="";
-  
-  
-  for (byte i = 0; i < N_OF_THP_SENSORS; i++)
-  {
-    if (t_sensor[i].number_of_receiving > 0) 
-    {
-      if (t_sensor[i].type == BTHGN129) pref = "20";
-      if (t_sensor[i].type == THGN132 ||t_sensor[i].type == THN132) pref = "30";
-      if ((oregon.sens_type & 0x0FFF) == RTGN318 || (oregon.sens_type & 0x0FFF) == RTHN318) pref = "40";
-      if (t_sensor[i].type == THGN500) pref = "50";
-      if ((t_sensor[i].type & 0xFF00) == THP) pref = "70";
-      if (t_sensor[i].type == THGR810 ||t_sensor[i].type == THN800) pref = "80";
-      if (t_sensor[i].type == BTHR968) pref = "90";
-      
-      s += "#TEMPC";
-      s += pref;
-      s += t_sensor[i].chnl;
-      s += "#";
-      s += t_sensor[i].temperature;
-      s += "\n";
-
-      if(t_sensor[i].chnl == 1) chanel = " в спальне";
-      if(t_sensor[i].chnl == 2) chanel = " на улице";
-
-      web1 +="<div class='data temperature'>";
-      web1 +="<div class='side-by-side icon'>";
-      web1 +="<svg enable-background='new 0 0 19.438 54.003'height=54.003px id=Layer_1 version=1.1 viewBox='0 0 19.438 54.003'width=19.438px x=0px xml:space=preserve xmlns=http://www.w3.org/2000/svg xmlns:xlink=http://www.w3.org/1999/xlink y=0px><g><path d='M11.976,8.82v-2h4.084V6.063C16.06,2.715,13.345,0,9.996,0H9.313C5.965,0,3.252,2.715,3.252,6.063v30.982";
-      web1 +="C1.261,38.825,0,41.403,0,44.286c0,5.367,4.351,9.718,9.719,9.718c5.368,0,9.719-4.351,9.719-9.718";
-      web1 +="c0-2.943-1.312-5.574-3.378-7.355V18.436h-3.914v-2h3.914v-2.808h-4.084v-2h4.084V8.82H11.976z M15.302,44.833";
-      web1 +="c0,3.083-2.5,5.583-5.583,5.583s-5.583-2.5-5.583-5.583c0-2.279,1.368-4.236,3.326-5.104V24.257C7.462,23.01,8.472,22,9.719,22";
-      web1 +="s2.257,1.01,2.257,2.257V39.73C13.934,40.597,15.302,42.554,15.302,44.833z'fill=#F29C21 /></g></svg>";
-      web1 +="</div>";
-      web1 +="<div class='side-by-side text'>Температура";
-      web1 +=chanel;
-      web1 +="</div>";
-      web1 +="<div class='side-by-side reading'>";
-      web1 +=t_sensor[i].temperature;
-      web1 +="<span class='superscript'>&deg;C</span></div>";
-      web1 +="</div>";
-
-      if (t_sensor[i].humidity > 0 && t_sensor[i].humidity <= 100  &&
-      (t_sensor[i].type == THGN132 || 
-      t_sensor[i].type == THGN500 ||
-      t_sensor[i].type == THGR810 ||
-      (t_sensor[i].type & 0x0FFF) == RTGN318) ||
-      (t_sensor[i].type == BTHGN129  ||
-      #if ADD_SENS_SUPPORT == 1
-      (t_sensor[i].type & 0xFF00) == THP  ||
-      #endif
-      t_sensor[i].type == BTHR968))
-      {
-        s += "#HUMMRH";
-        s += pref;
-        s += t_sensor[i].chnl;
-        s += "#";
-        s += t_sensor[i].humidity;
-        s += "\n";
-
-            if(t_sensor[i].chnl == 1) { chanel = " спальне"; }
-            if(t_sensor[i].chnl == 2) {chanel = " на улице"; }
-
-        web1 +="<div class='data humidity'>";
-        web1 +="<div class='side-by-side icon'>";
-        web1 +="<svg enable-background='new 0 0 29.235 40.64'height=40.64px id=Layer_1 version=1.1 viewBox='0 0 29.235 40.64'width=29.235px x=0px xml:space=preserve xmlns=http://www.w3.org/2000/svg xmlns:xlink=http://www.w3.org/1999/xlink y=0px><path d='M14.618,0C14.618,0,0,17.95,0,26.022C0,34.096,6.544,40.64,14.618,40.64s14.617-6.544,14.617-14.617";
-        web1 +="C29.235,17.95,14.618,0,14.618,0z M13.667,37.135c-5.604,0-10.162-4.56-10.162-10.162c0-0.787,0.638-1.426,1.426-1.426";
-        web1 +="c0.787,0,1.425,0.639,1.425,1.426c0,4.031,3.28,7.312,7.311,7.312c0.787,0,1.425,0.638,1.425,1.425";
-        web1 +="C15.093,36.497,14.455,37.135,13.667,37.135z'fill=#3C97D3 /></svg>";
-        web1 +="</div>";
-        web1 +="<div class='side-by-side text'>Влажность";
-        web1 +=chanel;
-        web1 +="</div>";
-        web1 +="<div class='side-by-side reading'>";
-        web1 +=t_sensor[i].humidity;
-        web1 +="<span class='superscript'>%</span></div>";
-        web1 +="</div>";
-
-      }
-
-      if ((t_sensor[i].type == BTHGN129  || 
-      #if ADD_SENS_SUPPORT == 1
-      (t_sensor[i].type & 0xFF00) == THP  ||
-      #endif
-      t_sensor[i].type == BTHR968))
-      {
-        s += "#P";
-        s += pref;
-        s += t_sensor[i].chnl;
-        s += "#";
-        s += t_sensor[i].pressure;
-        s += "\n";
-      }
-      #if ADD_SENS_SUPPORT == 1
-      if ((t_sensor[i].type & 0xFF00) == THP)
-      {
-        s += "#V";
-        s += pref;
-        s += t_sensor[i].chnl;
-        s += "#";
-        s += t_sensor[i].voltage;
-        s += "\n";
-      }
-    #endif
-    }
-  }
-  //Отправляем данные WGR800
-  if (wind_sensor.number_of_receiving > 0)
-  {
-    s += "#WSMID#";
-    s += wind_sensor.midspeed;
-    s += '\n';
-    s += "#WSMAX#";
-    s += wind_sensor.maxspeed;
-    s += '\n';    
-  } 
-  
-  if (wind_sensor.number_of_dir_receiving > 0 && wind_sensor.dir_cycle >= NO_WINDDIR) 
-  {
-    s += "#DIR#";
-    s += calc_wind_direction(&wind_sensor);
-    s += '\n';      
-  }
-    
-    
-  //Отправляем данные PCR800
-  if (rain_sensor.isreceived > 0)
-  {
-    s += "#RAIN#";
-    s += rain_sensor.counter;
-    s += '\n';
-  }
-    
-  //Отправляем данные UVN800
-  if (uv_sensor.isreceived > 0)
-  {
-    s += "#UV#";
-    s += uv_sensor.index;
-    s += '\n';
-  }
-
-  // Данные с BMP180
-  //показания температуры
-  s += "#TEMPC#";
-  s += bmp.readTemperature();
-  s += "\n";
-  //показания давления
-  s += "#PRESS#";
-  s += bmp.readPressure();
-  s += "#Датчик давления BMP180\n";
-  // уровень WIFI сигнала
-  int WIFIRSSI=constrain(((WiFi.RSSI()+100)*2),0,100);
-  s += "#WIFI#";
-  s += WIFIRSSI;
-  s += "#Уровень WI-FI ";
-  s += WiFi.SSID();
-  s += "\n"; 
-
-  if (flag != 1)Serial.print(s);
-//  if (flag == 1)Serial.print(web1);
-//  if (flag == 1)Serial.println(F("Дёрнул страницу!"));
-  if (!TEST_MODE & flag ==2) wclient.print(s);
-  return web1;
+  return false;
 }
 
-/////////////////////////////
-// Отсылка данных по MQTT
-/////////////////////////////
-void mqtt_send() {
+// ---------- JSON builder for narodmon ----------
+String buildNarodmonJson() {
+  String json = "{";
+  json += "\"devices\":[{";
+  json += "\"mac\":\"" mac "\"";
 
-  if (client.connect(MQTT::Connect( mac )
-       .set_auth(AIO_USERNAME, AIO_KEY))) {
-//  client.publish("outTopic","hello world");
+  json += ",\"sensors\":[";
+  bool first = true;
 
-  int WIFIRSSI=constrain(((WiFi.RSSI()+100)*2),0,100);
+  // Oregon sensors / Датчики Oregon
+  for (byte i = 0; i < NOF_132; i++) {
+    if (tsensor[i].numberofreceiving == 0) continue;
 
-          Serial.print(F("Sending childtemp "));
-          Serial.print(bmp.readTemperature());
-        if (! client.publish( AIO_TOPIC "/sensor/child/bmp180/temp", String(bmp.readTemperature()))) {
-          Serial.println(F(" Failed"));
-          } else {
-            Serial.println(F(" OK!"));
-          }
-          
-          Serial.print(F("Sending childpress "));
-          Serial.print(bmp.readPressure());
-        if (! client.publish( AIO_TOPIC "/sensor/child/bmp180/press", String(bmp.readPressure()/133.3-0.1))) {
-          Serial.println(F(" Failed"));
-          } else {
-            Serial.println(F(" OK!"));
-          }
-          
-          Serial.print(F("Sending childwifi "));
-          Serial.print(WIFIRSSI);
-        if (! client.publish( AIO_TOPIC "/sensor/child/bmp180/wifi", String(WIFIRSSI))) {
-          Serial.println(F(" Failed"));
-          } else {
-            Serial.println(F(" OK!"));
-          }
-  
-  for (byte i = 0; i < N_OF_THP_SENSORS; i++)
-  {
-    if (t_sensor[i].number_of_receiving > 0) 
-    {
-      // MQTT
-      if( t_sensor[i].chnl == 1 ) {
-          Serial.print(F("Sending bedroomtemp "));
-          Serial.print(t_sensor[i].temperature);
-        if (! client.publish( AIO_TOPIC "/sensor/bedroom/oregon/temp", String(t_sensor[i].temperature))) {
-          Serial.println(F(" Failed"));
-          } else {
-            Serial.println(F(" OK!"));
-          }
-      }
-      
-      if( t_sensor[i].chnl == 2 ) {
-          Serial.print(F("Sending outdortemp "));
-          Serial.print(t_sensor[i].temperature);
-        if (! client.publish( AIO_TOPIC "/sensor/outdor/oregon/temp", String(t_sensor[i].temperature))) {
-          Serial.println(F(" Failed"));
-          } else {
-            Serial.println(F(" OK!"));
-          }
-      }
-    
-      if (t_sensor[i].humidity > 0 && t_sensor[i].humidity <= 100  &&
-      (t_sensor[i].type == THGN132 || 
-      t_sensor[i].type == THGN500 ||
-      t_sensor[i].type == THGR810 ||
-      (t_sensor[i].type & 0x0FFF) == RTGN318) ||
-      (t_sensor[i].type == BTHGN129  ||
-      #if ADD_SENS_SUPPORT == 1
-      (t_sensor[i].type & 0xFF00) == THP  ||
-      #endif
-      t_sensor[i].type == BTHR968))
-      {
-        // MQTT
-        if( t_sensor[i].chnl == 1 ) {
-          Serial.print(F("Sending bedroomhumm "));
-          Serial.print(t_sensor[i].humidity);
-          if (! client.publish( AIO_TOPIC "/sensor/bedroom/oregon/humm", String(t_sensor[i].humidity))) {
-            Serial.println(F(" Failed"));
-            } else {
-              Serial.println(F(" OK!"));
-            }
-        }
-        if( t_sensor[i].chnl == 2 ) {
-          Serial.print(F("Sending outdorhumm "));
-          Serial.print(t_sensor[i].humidity);
-          if (! client.publish( AIO_TOPIC "/sensor/outdor/oregon/humm", String(t_sensor[i].humidity))) {
-            Serial.println(F(" Failed"));
-            } else {
-              Serial.println(F(" OK!"));
-            }
-        }
-      }
-    }
+    if (!first) json += ",";
+    first = false;
+
+    // Temperature sensor name (human‑readable) / Имя сенсора температуры
+    String chName = "Oregon Ch" + String(tsensor[i].chnl) + " Temp";
+    if (tsensor[i].chnl == 1) chName = "Bedroom Temp";
+    if (tsensor[i].chnl == 2) chName = "Outdoor Temp";
+    if (tsensor[i].chnl == 3) chName = "Channel3 Temp";
+
+    json += "{";
+    json += "\"id\":\"T" + String(tsensor[i].chnl) + "\",";
+    json += "\"name\":\"" + chName + "\",";
+    json += "\"value\":" + String(tsensor[i].temperature, 2) + ",";
+    json += "\"unit\":\"C\"";
+    json += "}";
+
+    // Humidity sensor name / Имя сенсора влажности
+    json += ",{";
+    String hName = "Oregon Ch" + String(tsensor[i].chnl) + " Hum";
+    if (tsensor[i].chnl == 1) hName = "Bedroom Hum";
+    if (tsensor[i].chnl == 2) hName = "Outdoor Hum";
+    if (tsensor[i].chnl == 3) hName = "Channel3 Hum";
+    json += "\"id\":\"H" + String(tsensor[i].chnl) + "\",";
+    json += "\"name\":\"" + hName + "\",";
+    json += "\"value\":" + String(tsensor[i].humidity, 2) + ",";
+    json += "\"unit\":\"%\"";
+    json += "}";
   }
- }
 
-client.disconnect();
+  // BMP180 temperature / Температура BMP180
+  if (!first) json += ",";
+  first = false;
+  json += "{";
+  json += "\"id\":\"TBMP\",";
+  json += "\"name\":\"BMP180 Temp\",";
+  json += "\"value\":" + String(bmp.readTemperature(), 2) + ",";
+  json += "\"unit\":\"C\"";
+  json += "}";
+
+  // BMP180 pressure (hPa) / Давление BMP180 (гПа)
+  float press_hpa = bmp.readPressure() / 100.0;
+  json += ",{";
+  json += "\"id\":\"PBMP\",";
+  json += "\"name\":\"BMP180 Pressure\",";
+  json += "\"value\":" + String(press_hpa, 2) + ",";
+  json += "\"unit\":\"hPa\"";
+  json += "}";
+
+  // WiFi RSSI (0..100%) / Уровень Wi‑Fi в %
+  int wifiPercent = wifiRssiToPercent(WiFi.RSSI());
+  json += ",{";
+  json += "\"id\":\"WIFI\",";
+  json += "\"name\":\"WiFi RSSI\",";
+  json += "\"value\":" + String(wifiPercent) + ",";
+  json += "\"unit\":\"%\"";
+  json += "}";
+
+  json += "]}]}";
+  return json;
 }
 
+// ---------- EEPROM config ----------
+void saveLogConfig() {
+  LogConfig cfg;
+  cfg.magic = EEPROM_MAGIC;
+  cfg.version = EEPROM_VERSION;
+  cfg.debugLevel = debugLevel;
+  cfg.logToSerial = logToSerial ? 1 : 0;
+  cfg.tzOffsetHours = tzOffsetHours;
+  cfg.refreshMainSec = refreshMainSec;
+  cfg.refreshLogSec = refreshLogSec;
 
-////////////////////////////////////////////////////////////////////////////////////////
-// Рассчёт направления ветра
-////////////////////////////////////////////////////////////////////////////////////////
-float calc_wind_direction(WGR800_sensor* wdata)
-{
- if (wdata->direction_x == 0) wdata->direction_x = 0.01;
- float otn = abs(wdata->direction_y / wdata->direction_x);
- float angle = (asin(otn / sqrt(1 + otn * otn))) * 180 / 3.14;
-  
- //Определяем направление
- if (wdata->direction_x > 0 && wdata->direction_y < 0) otn = angle; 
- if (wdata->direction_x < 0 && wdata->direction_y < 0) otn = 180 - angle;
- if (wdata->direction_x < 0 && wdata->direction_y >= 0) otn = 180 + angle;
- if (wdata->direction_x > 0 && wdata->direction_y >= 0) otn = 360 - angle;
-  
- angle = otn + WIND_CORRECTION; // Если маркер флюгера направлен не на север
- if (angle >= 360) angle -= 360;
- 
- return angle;
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.put(0, cfg);
+  EEPROM.commit();
 }
 
-////////////////////////////////////////////////////////////////////////////////////////
-// ЗАМЕНА DELAY, которая работает и не приводит к вылету...
-////////////////////////////////////////////////////////////////////////////////////////
-void wait_timer(int del){
-  unsigned long tm_marker = millis();
-  while (millis() - tm_marker < del) yield();
-  return;
-}
+// Load config from EEPROM or use defaults
+// Загрузка конфигурации из EEPROM или применяем значения по умолчанию
+void loadLogConfig() {
+  EEPROM.begin(EEPROM_SIZE);
+  LogConfig cfg;
+  EEPROM.get(0, cfg);
 
-////////////////////////////////////////////////////////////////////////////////////////
-// ВебСервер. Кнопка перезагрузки.
-////////////////////////////////////////////////////////////////////////////////////////
-void handle_reboot() {
-    Serial.println("Reset..");
-    ESP.restart();
-  server.send(200, "text/html", "Rebooting"); 
+  if (cfg.magic == EEPROM_MAGIC && cfg.version == EEPROM_VERSION) {
+    if (cfg.debugLevel <= 3) debugLevel = cfg.debugLevel;
+    logToSerial = (cfg.logToSerial != 0);
+    tzOffsetHours = cfg.tzOffsetHours;
+    refreshMainSec = cfg.refreshMainSec;
+    refreshLogSec = cfg.refreshLogSec;
+    if (tzOffsetHours < -12 || tzOffsetHours > 14) tzOffsetHours = 9;
+    if (refreshMainSec == 0) refreshMainSec = 30;
+    if (refreshLogSec == 0) refreshLogSec = 5;
+  } else {
+    debugLevel = DEBUG_LEVEL_DEFAULT;
+    logToSerial = true;
+    tzOffsetHours = 9;
+    refreshMainSec = 30;
+    refreshLogSec = 5;
+  }
 }
